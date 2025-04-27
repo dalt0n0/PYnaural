@@ -19,10 +19,9 @@ class BinauralApp:
         
         # Audio settings
         self.sample_rate = 44100
-        self.block_size = 1024  # Smaller block size for lower latency
+        self.block_size = 1024
         self.stream = None
         self.is_playing = False
-        self.audio_queue = queue.Queue(maxsize=4)  # Buffer a few blocks ahead
         self.tracks = []
         self.track_counter = 0
         self.volume = 0.5
@@ -30,7 +29,8 @@ class BinauralApp:
         self.current_sample = 0
         self.phase_accumulator = {}
         self.audio_lock = threading.Lock()
-        self.last_buffer_time = 0.0  # Track last buffer time for phase continuity
+        self.audio_queue = queue.Queue(maxsize=4)
+        self.last_buffer = None  # Store last buffer for smooth transitions
         
         # Create main container frames
         self.left_panel = ttk.Frame(self.root)
@@ -46,18 +46,17 @@ class BinauralApp:
     def audio_callback(self, outdata, frames, time, status):
         try:
             if self.is_playing:
-                # Calculate time values for this block with precise timing
+                # Calculate time values for this block
                 t = np.arange(self.current_sample, self.current_sample + frames) / self.sample_rate
                 
-                # Generate audio with phase continuity
+                # Generate audio
                 data = self.generate_audio(t)
                 
-                # Apply volume with soft clipping
-                data = self.soft_clip(data * self.volume)
+                # Apply volume
+                data *= self.volume
                 
-                # Update sample counter and timing
+                # Update sample counter
                 self.current_sample += frames
-                self.last_buffer_time = t[-1]
                 
                 # Write to output buffer
                 outdata[:] = data
@@ -77,14 +76,18 @@ class BinauralApp:
         self.play_button.config(text="Stop")
         self.current_sample = 0
         self.phase_accumulator = {}  # Reset phase accumulator
+        self.last_buffer = None  # Reset last buffer
         
         try:
-            # Start the audio stream
+            # Start the audio stream with specific settings
             self.stream = sd.OutputStream(
                 channels=2,
                 samplerate=self.sample_rate,
                 blocksize=self.block_size,
-                callback=self.audio_callback
+                callback=self.audio_callback,
+                dtype='float32',
+                latency='low',
+                prime_output_buffers_using_stream_callback=True
             )
             self.stream.start()
             
@@ -100,6 +103,7 @@ class BinauralApp:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+            self.last_buffer = None
     
     def on_closing(self):
         self.stop_playback()
@@ -301,7 +305,7 @@ class BinauralApp:
                     continue
                     
                 track_type = track['type']
-                track_volume = track['volume'].get()  # Get individual track volume
+                track_volume = track['volume'].get()
                 
                 if track_type == 'binaural':
                     track_data = self.generate_binaural(t, track)
@@ -312,161 +316,36 @@ class BinauralApp:
                 else:
                     continue
                 
-                # Apply panning
-                track_data = self.apply_panning(track_data, t, track)
-                
-                # Apply track volume before adding to mix
-                track_data *= track_volume
-                
-                # Add to output with proper mixing
-                output += track_data
-            
-            # Apply master volume
-            output *= self.volume
-            
-            # Apply soft clipping to prevent harsh digital clipping
-            output = self.soft_clip(output)
+                # Apply track volume and add to mix
+                output += track_data * track_volume
             
             return output
     
     def generate_binaural(self, t, track):
         base_freq = track["base_freq"].get()
         beat_freq = track["beat_freq"].get()
-        track_id = track["id"]
         
-        # Initialize phase tracking for this track if needed
-        track_key = f"binaural_{track_id}"
-        if track_key not in self.phase_accumulator:
-            self.phase_accumulator[track_key] = {
-                'left_phase': 0.0,
-                'right_phase': 0.0,
-                'time': 0.0
-            }
-        
-        # Calculate time-continuous frequencies for left and right channels
+        # Simple sine wave generation
         left_freq = base_freq - beat_freq/2
         right_freq = base_freq + beat_freq/2
         
-        # Calculate instantaneous phases using accumulated phase
-        dt = t[1] - t[0]  # Time step
-        num_samples = len(t)
-        
-        # Generate phase arrays with phase continuity
-        left_phase = np.zeros(num_samples)
-        right_phase = np.zeros(num_samples)
-        
-        # First sample uses accumulated phases
-        left_phase[0] = self.phase_accumulator[track_key]['left_phase']
-        right_phase[0] = self.phase_accumulator[track_key]['right_phase']
-        
-        # Generate remaining samples with phase continuity
-        for i in range(1, num_samples):
-            left_phase[i] = left_phase[i-1] + 2 * np.pi * left_freq * dt
-            right_phase[i] = right_phase[i-1] + 2 * np.pi * right_freq * dt
-        
-        # Generate audio using continuous phase with smooth transitions
-        # Use a smoother sine wave generation
-        left_channel = np.sin(left_phase) * 0.5  # Reduce amplitude to prevent clipping
-        right_channel = np.sin(right_phase) * 0.5
-        
-        # Store final phases for next buffer
-        self.phase_accumulator[track_key]['left_phase'] = left_phase[-1] % (2 * np.pi)
-        self.phase_accumulator[track_key]['right_phase'] = right_phase[-1] % (2 * np.pi)
-        self.phase_accumulator[track_key]['time'] = t[-1]
+        left_channel = np.sin(2 * np.pi * left_freq * t) * 0.5
+        right_channel = np.sin(2 * np.pi * right_freq * t) * 0.5
         
         return np.column_stack((left_channel, right_channel))
     
     def generate_noise(self, num_samples, track):
-        noise_type = track["noise_type"].get()
-        low_cut = track["low_cut"].get()
-        high_cut = track["high_cut"].get()
-        
-        # Generate appropriate noise type
-        if noise_type == "white":
-            noise = np.random.normal(0, 1, num_samples)
-        elif noise_type == "pink":
-            # Approximate pink noise
-            noise = np.random.normal(0, 1, num_samples)
-            # Apply 1/f filter
-            noise = self.apply_pink_filter(noise)
-        elif noise_type == "brown":
-            # Approximate brown noise
-            noise = np.random.normal(0, 1, num_samples)
-            # Apply 1/f^2 filter
-            noise = self.apply_brown_filter(noise)
-        else:
-            noise = np.random.normal(0, 1, num_samples)
-        
-        # Apply band-pass filter if needed
-        if low_cut > 20 or high_cut < 20000:
-            noise = self.apply_bandpass(noise, low_cut, high_cut)
-        
-        # Create stereo noise
-        stereo_noise = np.column_stack((noise, noise.copy()))
-        
-        return stereo_noise
-    
-    def apply_pink_filter(self, white_noise):
-        # Simple approximation of pink noise by filtering white noise
-        b, a = butter(1, 0.1, btype='low')
-        return lfilter(b, a, white_noise)
-    
-    def apply_brown_filter(self, white_noise):
-        # Brown noise approximation
-        b, a = butter(2, 0.05, btype='low')
-        return lfilter(b, a, white_noise)
-    
-    def apply_bandpass(self, data, low_freq, high_freq):
-        nyquist = 0.5 * self.sample_rate
-        low = low_freq / nyquist
-        high = high_freq / nyquist
-        
-        if low < 0.01:
-            # Lowpass only
-            b, a = butter(2, high, btype='low')
-        elif high > 0.99:
-            # Highpass only
-            b, a = butter(2, low, btype='high')
-        else:
-            # Bandpass
-            b, a = butter(2, [low, high], btype='band')
-        
-        return lfilter(b, a, data)
+        # Simple white noise
+        noise = np.random.normal(0, 0.5, num_samples)
+        return np.column_stack((noise, noise))
     
     def generate_tone(self, t, track):
-        track_id = track["id"]
         frequency = track["frequency"].get()
         
-        # Initialize phase tracking for this track if needed
-        if f"tone_{track_id}" not in self.phase_accumulator:
-            self.phase_accumulator[f"tone_{track_id}"] = {
-                'phase': 0.0,
-                'time': 0.0
-            }
+        # Simple sine wave generation
+        tone = np.sin(2 * np.pi * frequency * t) * 0.5
         
-        # Calculate time since last buffer for phase continuity
-        time_since_last = t[0] - self.phase_accumulator[f"tone_{track_id}"]['time']
-        if time_since_last < 0:  # Handle wraparound
-            time_since_last = t[0]
-        
-        # Calculate phase accumulation
-        phase = self.phase_accumulator[f"tone_{track_id}"]['phase']
-        phase += 2 * np.pi * frequency * time_since_last
-        
-        # Generate tone with continuous phase
-        tone = np.zeros_like(t)
-        for i in range(len(t)):
-            tone[i] = np.sin(phase) * 0.5  # Reduce amplitude to prevent clipping
-            phase += 2 * np.pi * frequency * (t[1] - t[0])
-        
-        # Store final phase and time
-        self.phase_accumulator[f"tone_{track_id}"]['phase'] = phase % (2 * np.pi)
-        self.phase_accumulator[f"tone_{track_id}"]['time'] = t[-1]
-        
-        # Create stereo tone
-        stereo_tone = np.column_stack((tone, tone))
-        
-        return stereo_tone
+        return np.column_stack((tone, tone))
     
     def apply_panning(self, stereo_data, t, track):
         pan_mode = track["pan_mode"].get()
@@ -890,6 +769,16 @@ class BinauralApp:
         pan_mode.trace_add("write", update_pan_controls)
         # Initial state
         update_pan_controls()
+
+    def apply_anti_aliasing(self, data):
+        """Apply a simple anti-aliasing filter"""
+        # Simple 2-pole lowpass filter
+        alpha = 0.1  # Filter coefficient
+        filtered = np.zeros_like(data)
+        filtered[0] = data[0]
+        for i in range(1, len(data)):
+            filtered[i] = alpha * data[i] + (1 - alpha) * filtered[i-1]
+        return filtered
 
 def main():
     root = tk.Tk()
