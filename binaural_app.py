@@ -19,7 +19,7 @@ class BinauralApp:
         
         # Audio settings
         self.sample_rate = 44100
-        self.block_size = 2048  # Smaller blocks for lower latency
+        self.block_size = 1024  # Smaller block size for lower latency
         self.stream = None
         self.is_playing = False
         self.audio_queue = queue.Queue(maxsize=4)  # Buffer a few blocks ahead
@@ -30,6 +30,7 @@ class BinauralApp:
         self.current_sample = 0
         self.phase_accumulator = {}
         self.audio_lock = threading.Lock()
+        self.last_buffer_time = 0.0  # Track last buffer time for phase continuity
         
         # Create main container frames
         self.left_panel = ttk.Frame(self.root)
@@ -45,15 +46,18 @@ class BinauralApp:
     def audio_callback(self, outdata, frames, time, status):
         try:
             if self.is_playing:
-                # Calculate time values for this block
+                # Calculate time values for this block with precise timing
                 t = np.arange(self.current_sample, self.current_sample + frames) / self.sample_rate
                 
-                # Generate audio
+                # Generate audio with phase continuity
                 data = self.generate_audio(t)
-                data = np.clip(data * self.volume, -1, 1)
                 
-                # Update sample counter
+                # Apply volume with soft clipping
+                data = self.soft_clip(data * self.volume)
+                
+                # Update sample counter and timing
                 self.current_sample += frames
+                self.last_buffer_time = t[-1]
                 
                 # Write to output buffer
                 outdata[:] = data
@@ -277,64 +281,53 @@ class BinauralApp:
         else:
             self.start_playback()
     
+    def soft_clip(self, data, threshold=0.8):
+        """Apply soft clipping to prevent harsh digital clipping"""
+        # Apply tanh-based soft clipping with smoother transition
+        return np.tanh(data * threshold) / threshold
+    
     def generate_audio(self, t):
-        try:
-            # Initialize empty stereo array
-            num_samples = len(t)
-            stereo_data = np.zeros((num_samples, 2))
+        """Generate audio for all active tracks"""
+        with self.audio_lock:
+            if not self.tracks:
+                return np.zeros((len(t), 2))
             
-            # Process each track
-            active_tracks = [track for track in self.tracks if track["enabled"].get()]
-            if not active_tracks:
-                return stereo_data
+            # Initialize output buffer
+            output = np.zeros((len(t), 2))
             
-            # Pre-allocate arrays for better performance
-            track_data = np.zeros((len(active_tracks), num_samples, 2))
-            
-            # Generate all track data in parallel
-            for i, track in enumerate(active_tracks):
-                track_type = track["type"]
-                track_volume = track["volume"].get() * 0.3  # Reduce base volume to 30%
+            # Generate each track
+            for track in self.tracks:
+                if not track['enabled'].get():
+                    continue
+                    
+                track_type = track['type']
+                track_volume = track['volume'].get()  # Get individual track volume
                 
-                if track_type == "binaural":
-                    track_data[i] = self.generate_binaural(t, track)
-                elif track_type == "noise":
-                    track_data[i] = self.generate_noise(num_samples, track)
-                elif track_type == "tone":
-                    track_data[i] = self.generate_tone(t, track)
+                if track_type == 'binaural':
+                    track_data = self.generate_binaural(t, track)
+                elif track_type == 'noise':
+                    track_data = self.generate_noise(len(t), track)
+                elif track_type == 'tone':
+                    track_data = self.generate_tone(t, track)
+                else:
+                    continue
                 
                 # Apply panning
-                track_data[i] = self.apply_panning(track_data[i], t, track)
+                track_data = self.apply_panning(track_data, t, track)
                 
-                # Apply individual track volume
-                track_data[i] *= track_volume
+                # Apply track volume before adding to mix
+                track_data *= track_volume
+                
+                # Add to output with proper mixing
+                output += track_data
             
-            # Mix all tracks with gradual limiting
-            if len(active_tracks) > 0:
-                # Sum all tracks
-                stereo_data = np.sum(track_data, axis=0)
-                
-                # Apply soft knee limiting
-                threshold = 0.8
-                knee = 0.1
-                ratio = 4.0
-                
-                magnitude = np.abs(stereo_data)
-                gain_reduction = np.ones_like(magnitude)
-                
-                # Calculate gain reduction for samples above threshold
-                mask = magnitude > (threshold - knee)
-                x = magnitude[mask]
-                gain_reduction[mask] = (threshold + (x - threshold) / ratio) / (x + 1e-10)
-                
-                # Apply gain reduction
-                stereo_data *= gain_reduction
+            # Apply master volume
+            output *= self.volume
             
-            return stereo_data
+            # Apply soft clipping to prevent harsh digital clipping
+            output = self.soft_clip(output)
             
-        except Exception as e:
-            print(f"Audio generation error: {e}")
-            return np.zeros((num_samples, 2))
+            return output
     
     def generate_binaural(self, t, track):
         base_freq = track["base_freq"].get()
@@ -358,7 +351,7 @@ class BinauralApp:
         dt = t[1] - t[0]  # Time step
         num_samples = len(t)
         
-        # Generate phase arrays
+        # Generate phase arrays with phase continuity
         left_phase = np.zeros(num_samples)
         right_phase = np.zeros(num_samples)
         
@@ -371,13 +364,14 @@ class BinauralApp:
             left_phase[i] = left_phase[i-1] + 2 * np.pi * left_freq * dt
             right_phase[i] = right_phase[i-1] + 2 * np.pi * right_freq * dt
         
-        # Generate audio using continuous phase
-        left_channel = np.sin(left_phase)
-        right_channel = np.sin(right_phase)
+        # Generate audio using continuous phase with smooth transitions
+        # Use a smoother sine wave generation
+        left_channel = np.sin(left_phase) * 0.5  # Reduce amplitude to prevent clipping
+        right_channel = np.sin(right_phase) * 0.5
         
         # Store final phases for next buffer
-        self.phase_accumulator[track_key]['left_phase'] = left_phase[-1]
-        self.phase_accumulator[track_key]['right_phase'] = right_phase[-1]
+        self.phase_accumulator[track_key]['left_phase'] = left_phase[-1] % (2 * np.pi)
+        self.phase_accumulator[track_key]['right_phase'] = right_phase[-1] % (2 * np.pi)
         self.phase_accumulator[track_key]['time'] = t[-1]
         
         return np.column_stack((left_channel, right_channel))
@@ -441,96 +435,33 @@ class BinauralApp:
     
     def generate_tone(self, t, track):
         track_id = track["id"]
+        frequency = track["frequency"].get()
         
         # Initialize phase tracking for this track if needed
         if f"tone_{track_id}" not in self.phase_accumulator:
             self.phase_accumulator[f"tone_{track_id}"] = {
                 'phase': 0.0,
-                'mod_phase': 0.0,
-                'last_freq': track["frequency"].get() if not track["mod_enabled"].get() else track["min_freq"].get(),
-                'last_time': 0.0
+                'time': 0.0
             }
         
         # Calculate time since last buffer for phase continuity
-        time_since_last = t[0] - self.phase_accumulator[f"tone_{track_id}"]['last_time']
+        time_since_last = t[0] - self.phase_accumulator[f"tone_{track_id}"]['time']
         if time_since_last < 0:  # Handle wraparound
             time_since_last = t[0]
         
-        # Generate base tone with phase continuity
-        if track["mod_enabled"].get():
-            min_freq = track["min_freq"].get()
-            max_freq = track["max_freq"].get()
-            mod_speed = track["mod_speed"].get()
-            
-            # Calculate modulation with phase continuity
-            mod_phase = self.phase_accumulator[f"tone_{track_id}"]['mod_phase']
-            mod_phase += 2 * np.pi * mod_speed * time_since_last  # Add phase for gap
-            mod = np.zeros_like(t)
-            for i in range(len(t)):
-                mod[i] = 0.5 * (1 + np.sin(mod_phase))
-                mod_phase += 2 * np.pi * mod_speed * (t[1] - t[0])
-            
-            # Calculate instantaneous frequency
-            freq = min_freq + (max_freq - min_freq) * mod
-            
-            # Update modulation phase
-            self.phase_accumulator[f"tone_{track_id}"]['mod_phase'] = mod_phase % (2 * np.pi)
-            
-            # Calculate phase accumulation with frequency interpolation
-            phase = self.phase_accumulator[f"tone_{track_id}"]['phase']
-            phase += 2 * np.pi * self.phase_accumulator[f"tone_{track_id}"]['last_freq'] * time_since_last
-            
-            tone = np.zeros_like(t)
-            for i in range(len(t)):
-                tone[i] = np.sin(phase)
-                phase += 2 * np.pi * freq[i] * (t[1] - t[0])
-            
-            # Store last frequency for next buffer
-            self.phase_accumulator[f"tone_{track_id}"]['last_freq'] = freq[-1]
-            
-        else:
-            base_freq = track["frequency"].get()
-            
-            # Calculate phase accumulation
-            phase = self.phase_accumulator[f"tone_{track_id}"]['phase']
-            phase += 2 * np.pi * self.phase_accumulator[f"tone_{track_id}"]['last_freq'] * time_since_last
-            
-            # Generate tone with continuous phase
-            tone = np.zeros_like(t)
-            for i in range(len(t)):
-                tone[i] = np.sin(phase)
-                phase += 2 * np.pi * base_freq * (t[1] - t[0])
-            
-            # Store frequency for next buffer
-            self.phase_accumulator[f"tone_{track_id}"]['last_freq'] = base_freq
+        # Calculate phase accumulation
+        phase = self.phase_accumulator[f"tone_{track_id}"]['phase']
+        phase += 2 * np.pi * frequency * time_since_last
+        
+        # Generate tone with continuous phase
+        tone = np.zeros_like(t)
+        for i in range(len(t)):
+            tone[i] = np.sin(phase) * 0.5  # Reduce amplitude to prevent clipping
+            phase += 2 * np.pi * frequency * (t[1] - t[0])
         
         # Store final phase and time
         self.phase_accumulator[f"tone_{track_id}"]['phase'] = phase % (2 * np.pi)
-        self.phase_accumulator[f"tone_{track_id}"]['last_time'] = t[-1]
-        
-        # Apply isochronic pulses if enabled
-        if track["iso_enabled"].get():
-            iso_freq = track["iso_freq"].get()
-            iso_depth = track["iso_depth"].get()
-            
-            # Calculate pulse envelope with phase continuity
-            if f"tone_{track_id}_iso_phase" not in self.phase_accumulator:
-                self.phase_accumulator[f"tone_{track_id}_iso_phase"] = 0.0
-            
-            iso_phase = self.phase_accumulator[f"tone_{track_id}_iso_phase"]
-            iso_phase += 2 * np.pi * iso_freq * time_since_last
-            
-            pulse_env = np.zeros_like(t)
-            for i in range(len(t)):
-                # Use sine-squared for smoother pulsing
-                pulse_env[i] = 1.0 - iso_depth * np.sin(iso_phase) ** 2
-                iso_phase += 2 * np.pi * iso_freq * (t[1] - t[0])
-            
-            # Store isochronic phase
-            self.phase_accumulator[f"tone_{track_id}_iso_phase"] = iso_phase % (2 * np.pi)
-            
-            # Apply envelope with smooth transitions
-            tone *= pulse_env
+        self.phase_accumulator[f"tone_{track_id}"]['time'] = t[-1]
         
         # Create stereo tone
         stereo_tone = np.column_stack((tone, tone))
@@ -574,101 +505,87 @@ class BinauralApp:
             return panned_data
 
     def export_wav(self):
+        """Export the current audio to a WAV file"""
         if not self.tracks:
             messagebox.showinfo("No Tracks", "Please add at least one track first.")
             return
-        
-        # Ask for file location
+            
+        # Get save location
         file_path = filedialog.asksaveasfilename(
             defaultextension=".wav",
-            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")],
-            title="Export WAV File"
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
         )
         
         if not file_path:
-            return  # User cancelled
-        
-        # Calculate total samples
-        total_samples = int(self.duration * self.sample_rate)
-        chunk_size = self.sample_rate  # Process 1 second at a time
-        
-        # Show progress dialog
-        progress_window = tk.Toplevel(self.root)
-        progress_window.title("Exporting...")
-        progress_window.geometry("300x150")
-        progress_window.transient(self.root)
-        progress_window.grab_set()
-        
-        # Center the window
-        progress_window.update_idletasks()
-        x = (progress_window.winfo_screenwidth() - progress_window.winfo_width()) // 2
-        y = (progress_window.winfo_screenheight() - progress_window.winfo_height()) // 2
-        progress_window.geometry(f"+{x}+{y}")
-        
-        # Status label
-        status_label = ttk.Label(progress_window, text="Generating audio...\n0%")
-        status_label.pack(pady=10)
-        
-        # Progress bar
-        progress_bar = ttk.Progressbar(progress_window, mode="determinate", length=250)
-        progress_bar.pack(fill="x", padx=20, pady=10)
-        
-        # Cancel button
-        cancel_var = tk.BooleanVar(value=False)
-        cancel_btn = ttk.Button(progress_window, text="Cancel", 
-                              command=lambda: cancel_var.set(True))
-        cancel_btn.pack(pady=10)
-        
-        # Function to update progress
-        def update_progress(current, total, status_text="Generating audio..."):
-            if not progress_window.winfo_exists():
-                return
-            progress = (current / total) * 100
-            progress_bar["value"] = progress
-            status_label["text"] = f"{status_text}\n{progress:.1f}%"
-            progress_window.update()
-        
-        # Function to handle export in background
-        def do_export():
-            try:
-                # Initialize output array
-                stereo_data = np.zeros((total_samples, 2))
-                
-                # Generate audio in chunks
-                for start in range(0, total_samples, chunk_size):
-                    if cancel_var.get():
-                        self.root.after(0, progress_window.destroy)
-                        return
+            return
+            
+        try:
+            # Calculate total samples
+            total_samples = int(self.duration * self.sample_rate)
+            
+            # Create progress window
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("Exporting...")
+            progress_window.geometry("300x100")
+            progress_window.transient(self.root)
+            progress_window.grab_set()
+            
+            progress_var = tk.DoubleVar()
+            progress_bar = ttk.Progressbar(progress_window, variable=progress_var, maximum=100)
+            progress_bar.pack(fill="x", padx=10, pady=10)
+            
+            status_label = ttk.Label(progress_window, text="Generating audio...")
+            status_label.pack(pady=5)
+            
+            def update_progress(current, total, status_text="Generating audio..."):
+                progress = (current / total) * 100
+                progress_var.set(progress)
+                status_label.config(text=status_text)
+                progress_window.update()
+            
+            def do_export():
+                try:
+                    # Generate audio in chunks to prevent memory issues
+                    chunk_size = 44100  # 1 second chunks
+                    audio_data = np.zeros((total_samples, 2))
+                    
+                    for i in range(0, total_samples, chunk_size):
+                        chunk_end = min(i + chunk_size, total_samples)
+                        t = np.arange(i, chunk_end) / self.sample_rate
                         
-                    end = min(start + chunk_size, total_samples)
-                    t = np.arange(start, end) / self.sample_rate
+                        # Generate chunk
+                        chunk = self.generate_audio(t)
+                        
+                        # Apply soft clipping to prevent harsh digital clipping
+                        chunk = self.soft_clip(chunk)
+                        
+                        # Store chunk
+                        audio_data[i:chunk_end] = chunk
+                        
+                        # Update progress
+                        update_progress(chunk_end, total_samples)
                     
-                    # Generate chunk
-                    chunk_data = self.generate_audio(t)
-                    stereo_data[start:end] = chunk_data
+                    # Normalize the final audio
+                    max_val = np.max(np.abs(audio_data))
+                    if max_val > 1.0:
+                        audio_data /= max_val
                     
-                    # Update progress
-                    self.root.after(0, update_progress, end, total_samples)
-                
-                # Update status
-                self.root.after(0, update_progress, 1, 1, "Writing to file...")
-                
-                # Write to WAV file
-                sf.write(file_path, stereo_data, self.sample_rate)
-                
-                # Close progress dialog and show success message
-                self.root.after(0, progress_window.destroy)
-                self.root.after(0, lambda: messagebox.showinfo("Export Complete", 
-                                                         f"Audio saved to:\n{file_path}"))
-            except Exception as e:
-                self.root.after(0, progress_window.destroy)
-                self.root.after(0, lambda: messagebox.showerror("Export Failed", 
-                                                         f"Error: {str(e)}"))
-        
-        # Start export in a separate thread
-        export_thread = threading.Thread(target=do_export)
-        export_thread.daemon = True
-        export_thread.start()
+                    # Save to file
+                    update_progress(total_samples, total_samples, "Saving file...")
+                    sf.write(file_path, audio_data, self.sample_rate)
+                    
+                    progress_window.destroy()
+                    messagebox.showinfo("Success", "Audio exported successfully!")
+                    
+                except Exception as e:
+                    progress_window.destroy()
+                    messagebox.showerror("Error", f"Failed to export audio: {str(e)}")
+            
+            # Start export in a separate thread
+            threading.Thread(target=do_export, daemon=True).start()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export audio: {str(e)}")
     
     def export_settings(self):
         if not self.tracks:
