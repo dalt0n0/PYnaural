@@ -82,4 +82,43 @@ If you prefer to set things up manually:
 MIT License - Feel free to use and modify as needed.
 
 ## Contributing
-Contributions are welcome! Please feel free to submit pull requests. 
+Contributions are welcome! Please feel free to submit pull requests.
+
+## Audio Generation Details
+
+### Noise Generation
+The application supports three types of noise:
+- **White Noise**: Pure random noise with equal energy across all frequencies
+- **Pink Noise**: Noise with equal energy per octave (1/f), created using a moving average filter
+- **Brown Noise**: Noise with energy decreasing by 6dB per octave (1/f²), created using a larger moving average filter
+
+### Frequency Control
+- **Low Cut**: Applies a high-pass filter to remove frequencies below the specified value
+- **High Cut**: Applies a low-pass filter to remove frequencies above the specified value
+- Both filters use 4th-order Butterworth filters for clean frequency response
+
+### Panning
+The application supports several panning modes:
+- **Left**: Audio plays only in the left channel
+- **Right**: Audio plays only in the right channel
+- **Center**: Audio plays equally in both channels
+- **L-R**: Smooth panning sweep from left to right
+- **R-L**: Smooth panning sweep from right to left
+
+Panning controls:
+- **Speed**: Controls how fast the panning sweeps occur (in Hz)
+- **Depth**: Controls how extreme the panning is (0 = centered, 1 = full pan)
+
+### Audio Processing
+- Sample rate: 44.1kHz
+- Block size: 1024 samples
+- Soft clipping is applied to prevent digital distortion
+- Gain compensation ensures consistent volume levels across different noise types
+- Thread-safe audio generation to prevent glitches
+
+### Technical Notes
+- The application uses `sounddevice` for real-time audio playback
+- `numpy` is used for efficient audio processing
+- `scipy.signal` provides the filtering functions
+- All audio processing is done in real-time with minimal latency
+- The application includes proper error handling and resource cleanup 
