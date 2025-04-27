@@ -32,6 +32,10 @@ class BinauralApp:
         self.audio_queue = queue.Queue(maxsize=4)
         self.last_buffer = None  # Store last buffer for smooth transitions
         
+        # Initialize filter states
+        self.pink_filter_state = None
+        self.brown_filter_state = None
+        
         # Create main container frames
         self.left_panel = ttk.Frame(self.root)
         self.left_panel.pack(side="left", fill="both", expand=True, padx=5, pady=5)
@@ -77,6 +81,10 @@ class BinauralApp:
         self.current_sample = 0
         self.phase_accumulator = {}  # Reset phase accumulator
         self.last_buffer = None  # Reset last buffer
+        
+        # Reset filter states
+        self.pink_filter_state = None
+        self.brown_filter_state = None
         
         try:
             # Start the audio stream with specific settings
@@ -316,6 +324,9 @@ class BinauralApp:
                 else:
                     continue
                 
+                # Apply panning
+                track_data = self.apply_panning(track_data, t, track)
+                
                 # Apply track volume and add to mix
                 output += track_data * track_volume
             
@@ -335,8 +346,33 @@ class BinauralApp:
         return np.column_stack((left_channel, right_channel))
     
     def generate_noise(self, num_samples, track):
-        # Simple white noise
-        noise = np.random.normal(0, 0.5, num_samples)
+        noise_type = track["noise_type"].get()
+        
+        if noise_type == "white":
+            # White noise with reduced amplitude
+            noise = np.random.normal(0, 0.2, num_samples)
+        elif noise_type == "pink":
+            # Generate white noise first
+            white_noise = np.random.normal(0, 0.2, num_samples)
+            # Apply pink filter
+            noise = self.apply_pink_filter(white_noise)
+        elif noise_type == "brown":
+            # Generate white noise first
+            white_noise = np.random.normal(0, 0.2, num_samples)
+            # Apply brown filter
+            noise = self.apply_brown_filter(white_noise)
+        else:
+            noise = np.random.normal(0, 0.2, num_samples)
+        
+        # Apply bandpass filtering if enabled
+        low_cut = track["low_cut"].get()
+        high_cut = track["high_cut"].get()
+        if low_cut > 20 or high_cut < 20000:  # Only apply if not full range
+            noise = self.apply_bandpass_filter(noise, low_cut, high_cut)
+        
+        # Apply soft clipping to prevent any potential clipping
+        noise = self.soft_clip(noise, threshold=0.8)
+        
         return np.column_stack((noise, noise))
     
     def generate_tone(self, t, track):
@@ -348,41 +384,61 @@ class BinauralApp:
         return np.column_stack((tone, tone))
     
     def apply_panning(self, stereo_data, t, track):
-        pan_mode = track["pan_mode"].get()
+        """Apply panning to stereo audio data"""
+        pan = track['pan'].get()
         
-        if pan_mode == "center":
-            return stereo_data
-        elif pan_mode == "hard-left":
-            return np.column_stack((stereo_data[:, 0], np.zeros_like(stereo_data[:, 1])))
-        elif pan_mode == "hard-right":
-            return np.column_stack((np.zeros_like(stereo_data[:, 0]), stereo_data[:, 1]))
-        else:  # auto-pan
-            pan_speed = track["pan_speed"].get()
-            pan_depth = track["pan_depth"].get()
-            pan_direction = track["pan_direction"].get()
-            
-            # Create panning envelope
-            if pan_direction == "left-to-right":
-                pan_env = pan_depth * np.sin(2 * np.pi * pan_speed * t)
-            elif pan_direction == "right-to-left":
-                pan_env = -pan_depth * np.sin(2 * np.pi * pan_speed * t)
-            else:  # alternate
-                pan_env = pan_depth * np.sin(2 * np.pi * pan_speed * t)
-            
-            # Apply panning using equal power law
-            pan_pos = np.clip(pan_env, -1, 1)
-            angle = (pan_pos + 1) * np.pi / 4  # Convert -1..1 to 0..π/2
-            
-            left_gain = np.cos(angle)
-            right_gain = np.sin(angle)
-            
-            # Apply the gains to create the stereo effect
-            panned_data = np.zeros_like(stereo_data)
-            panned_data[:, 0] = stereo_data[:, 0] * left_gain
-            panned_data[:, 1] = stereo_data[:, 1] * right_gain
-            
-            return panned_data
-
+        if pan == "Left":
+            # Left channel only
+            stereo_data[:, 1] = 0
+        elif pan == "Right":
+            # Right channel only
+            stereo_data[:, 0] = 0
+        elif pan == "Center":
+            # Both channels equal
+            pass
+        elif pan == "L-R":
+            # Left to right sweep
+            pan_speed = track['pan_speed'].get()
+            pan_depth = track['pan_depth'].get()
+            sweep = np.sin(2 * np.pi * pan_speed * t)  # Sweep at specified speed
+            stereo_data[:, 0] *= (1 + sweep * pan_depth) / 2
+            stereo_data[:, 1] *= (1 - sweep * pan_depth) / 2
+        elif pan == "R-L":
+            # Right to left sweep
+            pan_speed = track['pan_speed'].get()
+            pan_depth = track['pan_depth'].get()
+            sweep = np.sin(2 * np.pi * pan_speed * t)  # Sweep at specified speed
+            stereo_data[:, 0] *= (1 - sweep * pan_depth) / 2
+            stereo_data[:, 1] *= (1 + sweep * pan_depth) / 2
+        
+        return stereo_data
+    
+    def apply_pink_filter(self, white_noise):
+        """Apply a simple 1/f filter to approximate pink noise"""
+        # Use a simple moving average filter for stability
+        window_size = 10
+        kernel = np.ones(window_size) / window_size
+        filtered = np.convolve(white_noise, kernel, mode='same')
+        # Apply gain compensation
+        return filtered * 0.4
+    
+    def apply_brown_filter(self, white_noise):
+        """Apply a simple 1/f^2 filter to approximate brown noise"""
+        # Use a larger moving average filter for more low-frequency emphasis
+        window_size = 20
+        kernel = np.ones(window_size) / window_size
+        filtered = np.convolve(white_noise, kernel, mode='same')
+        # Apply gain compensation
+        return filtered * 0.25
+    
+    def apply_bandpass_filter(self, signal, low_cut, high_cut):
+        """Apply a bandpass filter to the signal"""
+        nyquist = self.sample_rate / 2
+        low = low_cut / nyquist
+        high = high_cut / nyquist
+        b, a = butter(4, [low, high], btype='band')
+        return lfilter(b, a, signal)
+    
     def export_wav(self):
         """Export the current audio to a WAV file"""
         if not self.tracks:
@@ -729,10 +785,10 @@ class BinauralApp:
         
         # Pan mode selection
         ttk.Label(pan_frame, text="Pan Mode:").pack(side="left", padx=5)
-        pan_mode = tk.StringVar(value=settings["pan_mode"] if settings else "center")
-        track_data["pan_mode"] = pan_mode
-        mode_combo = ttk.Combobox(pan_frame, textvariable=pan_mode,
-                                 values=["center", "hard-left", "hard-right", "auto-pan"],
+        pan = tk.StringVar(value=settings["pan"] if settings else "Center")
+        track_data["pan"] = pan
+        mode_combo = ttk.Combobox(pan_frame, textvariable=pan,
+                                 values=["Left", "Right", "Center", "L-R", "R-L"],
                                  state="readonly", width=12)
         mode_combo.pack(side="left", padx=5)
         
@@ -760,13 +816,13 @@ class BinauralApp:
         
         # Function to toggle auto-pan controls visibility
         def update_pan_controls(*args):
-            if pan_mode.get() == "auto-pan":
+            if pan.get() == "auto-pan":
                 auto_pan_frame.pack(fill="x", padx=5, pady=2)
             else:
                 auto_pan_frame.pack_forget()
         
         # Bind the update function to pan mode changes
-        pan_mode.trace_add("write", update_pan_controls)
+        pan.trace_add("write", update_pan_controls)
         # Initial state
         update_pan_controls()
 
